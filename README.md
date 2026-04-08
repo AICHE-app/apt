@@ -9,7 +9,7 @@ APT repository for AICHE Desktop on Linux.
 curl -fsSL https://apt.aiche.app/aiche.gpg | sudo tee /usr/share/keyrings/aiche.gpg > /dev/null
 
 # Add APT source
-echo "deb [signed-by=/usr/share/keyrings/aiche.gpg] https://apt.aiche.app stable main" | sudo tee /etc/apt/sources.list.d/aiche.list
+echo "deb [signed-by=/usr/share/keyrings/aiche.gpg arch=amd64] https://apt.aiche.app stable main" | sudo tee /etc/apt/sources.list.d/aiche.list
 
 # Install
 sudo apt update && sudo apt install aiche-desktop
