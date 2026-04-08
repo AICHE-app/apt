@@ -53,6 +53,7 @@ jobs:
           mkdir -p _site
           cp -r dists pool _site/
           cp aiche.gpg _site/
+          cp install.sh _site/
           cp CNAME _site/
           touch _site/.nojekyll
 
