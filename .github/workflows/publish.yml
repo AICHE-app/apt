@@ -1,0 +1,71 @@
+name: Publish APT Repository
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (e.g., 1.1.2)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install reprepro
+        run: sudo apt-get update && sudo apt-get install -y reprepro
+
+      - name: Import GPG key
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+
+      - name: Download .deb from linux-releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "v${{ inputs.version }}" \
+            --repo AICHE-app/linux-releases \
+            --pattern "aiche-desktop_*_amd64.deb" \
+            --dir .
+
+      - name: Build APT repository
+        run: |
+          # Initialize reprepro database
+          reprepro -b . export
+
+          # Add the .deb package
+          reprepro -b . includedeb stable aiche-desktop_*_amd64.deb
+
+      - name: Prepare Pages artifact
+        run: |
+          mkdir -p _site
+          cp -r dists pool _site/
+          cp aiche.gpg _site/
+          cp CNAME _site/
+          touch _site/.nojekyll
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

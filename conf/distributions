@@ -1,0 +1,8 @@
+Origin: AICHE
+Label: AICHE
+Codename: stable
+Suite: stable
+Architectures: amd64
+Components: main
+SignWith: F0CB3E6D1601B88373812B4752B08E639E37FBF1
+Description: AICHE Desktop APT Repository
