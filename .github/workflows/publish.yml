@@ -1,11 +1,30 @@
 name: Publish APT Repository
 
+# This used to be workflow_dispatch only, with a required version typed in by
+# hand. It ran three times, all on 2026-04-08, and then never again. Fifteen
+# releases shipped to GitHub and the Snap Store while apt.aiche.app went on
+# serving 1.1.2, so anyone who installed from the repo was pinned to April and
+# `apt upgrade` told them they were current.
+#
+# Nothing forgot to run it. Nothing was ever going to run it: there was no
+# trigger, and a manual step written down in a checklist is exactly what got us
+# fifteen releases behind.
+#
+# So the schedule below is the real fix. Every hour it compares the version
+# actually being served by apt.aiche.app against the newest release in
+# linux-releases, and republishes when they differ. It heals a missed release,
+# a failed run, and a deploy that silently did not take, because it checks the
+# served bytes rather than any record of what we believe we published.
 on:
+  schedule:
+    # Hourly, off the hour, to stay out of the crowd at :00 where GitHub
+    # queues scheduled jobs and delays them.
+    - cron: '23 * * * *'
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to publish (e.g., 1.1.2)'
-        required: true
+        description: 'Version to publish (leave blank to use the newest release)'
+        required: false
         type: string
 
 permissions:
@@ -20,28 +39,80 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.decide.outputs.publish }}
+      version: ${{ steps.decide.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Decide whether anything needs publishing
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          want="${{ inputs.version }}"
+          if [ -z "$want" ]; then
+            # The newest release, whatever it is. Nobody types a version and
+            # nobody has to remember this exists.
+            want=$(gh release view --repo AICHE-app/linux-releases \
+                     --json tagName --jq '.tagName' | sed 's/^v//')
+          fi
+
+          # What the world is actually being served right now. Deliberately the
+          # live URL and not a file in this repo: the question is what a user
+          # gets from `apt install`, and only the served Packages index answers
+          # that. A run that "succeeded" while Pages kept the old content is a
+          # failure this catches and a repo-side check would not.
+          have=$(curl -fsSL --max-time 30 \
+                   https://apt.aiche.app/dists/stable/main/binary-amd64/Packages \
+                 | awk '/^Version:/ {print $2; exit}' || echo "none")
+
+          echo "serving: ${have}"
+          echo "newest : ${want}"
+          echo "version=${want}" >> "$GITHUB_OUTPUT"
+
+          if [ "$have" = "$want" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Already current, nothing to do."
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install reprepro
+        if: steps.decide.outputs.publish == 'true'
         run: sudo apt-get update && sudo apt-get install -y reprepro
 
       - name: Import GPG key
+        if: steps.decide.outputs.publish == 'true'
         run: |
           echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
 
       - name: Download .deb from linux-releases
+        if: steps.decide.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release download "v${{ inputs.version }}" \
+          set -euo pipefail
+          gh release download "v${{ steps.decide.outputs.version }}" \
             --repo AICHE-app/linux-releases \
             --pattern "aiche-desktop_*_amd64.deb" \
             --dir .
 
+          # A release with no DEB is a broken publish, not an empty one. Fail
+          # loudly here rather than deploying an APT repo with nothing in it.
+          count=$(ls -1 aiche-desktop_*_amd64.deb 2>/dev/null | wc -l)
+          if [ "$count" -ne 1 ]; then
+            echo "Expected exactly one amd64 .deb, found ${count}" >&2
+            exit 1
+          fi
+
       - name: Build APT repository
+        if: steps.decide.outputs.publish == 'true'
         run: |
+          set -euo pipefail
           # Initialize reprepro database
           reprepro -b . export
 
@@ -49,7 +120,9 @@ jobs:
           reprepro -b . includedeb stable aiche-desktop_*_amd64.deb
 
       - name: Prepare Pages artifact
+        if: steps.decide.outputs.publish == 'true'
         run: |
+          set -euo pipefail
           mkdir -p _site
           cp -r dists pool _site/
           cp aiche.gpg _site/
@@ -57,11 +130,23 @@ jobs:
           cp CNAME _site/
           touch _site/.nojekyll
 
+          # What is about to be deployed, checked before it is deployed rather
+          # than hoped for afterwards.
+          built=$(awk '/^Version:/ {print $2; exit}' \
+                    _site/dists/stable/main/binary-amd64/Packages)
+          if [ "$built" != "${{ steps.decide.outputs.version }}" ]; then
+            echo "Built index says ${built}, expected ${{ steps.decide.outputs.version }}" >&2
+            exit 1
+          fi
+          echo "Publishing ${built}"
+
       - name: Upload Pages artifact
+        if: steps.decide.outputs.publish == 'true'
         uses: actions/upload-pages-artifact@v4
 
   deploy:
     needs: build
+    if: needs.build.outputs.publish == 'true'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -70,3 +155,28 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5
+
+  verify:
+    needs: [build, deploy]
+    if: needs.build.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm the live repository serves the new version
+        run: |
+          set -euo pipefail
+          want="${{ needs.build.outputs.version }}"
+
+          # Pages takes a moment to go live. Give it a few tries rather than
+          # declaring success the instant the deploy step returns, which is
+          # what would let a silent no-op look like a green run.
+          for attempt in 1 2 3 4 5 6; do
+            have=$(curl -fsSL --max-time 30 \
+                     https://apt.aiche.app/dists/stable/main/binary-amd64/Packages \
+                   | awk '/^Version:/ {print $2; exit}' || echo "none")
+            echo "attempt ${attempt}: serving ${have}, want ${want}"
+            [ "$have" = "$want" ] && exit 0
+            sleep 20
+          done
+
+          echo "apt.aiche.app is still not serving ${want}" >&2
+          exit 1
